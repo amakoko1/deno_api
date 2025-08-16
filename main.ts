@@ -1,79 +1,118 @@
-// main.ts - Recommended version for Deno Deploy
+// main.ts - Deno Deploy 版代理伺服器
 
-// --- Configuration ---
-// Using Deno.env.get for flexible configuration. Best practice for deployment.
-const API_KEY = Deno.env.get("PROXY_API_KEY") || "";
-const MAX_REQS_PER_MINUTE = Number(Deno.env.get("MAX_REQS_PER_MINUTE") || "30");
+// 讀取環境變數
+const PROXY_USERNAME = Deno.env.get("PROXY_USERNAME") || "";
+const PROXY_PASSWORD = Deno.env.get("PROXY_PASSWORD") || "";
 
-const requestsLog: Record<string, number[]> = {};
-
-// Helper: Rate limiting
-function checkRateLimit(key: string) {
-  const now = Date.now();
-  if (!requestsLog[key]) requestsLog[key] = [];
-  requestsLog[key] = requestsLog[key].filter(ts => now - ts < 60_000);
-  if (requestsLog[key].length >= MAX_REQS_PER_MINUTE) {
+// 檢查認證
+function checkAuth(authHeader: string | null): boolean {
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
     return false;
   }
-  requestsLog[key].push(now);
-  return true;
+  const base64 = authHeader.replace("Basic ", "");
+  const decoded = atob(base64);
+  const [user, pass] = decoded.split(":");
+  return user === PROXY_USERNAME && pass === PROXY_PASSWORD;
 }
 
-// SSRF basic protection
-function isPrivateHost(url: URL): boolean {
-  return ["localhost", "127.0.0.1"].includes(url.hostname);
+// 建立 401 認證挑戰回應
+function unauthorized(): Response {
+  return new Response(
+    JSON.stringify({ message: "Authentication required!" }),
+    {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": 'Basic realm="Login Required"',
+        "Content-Type": "application/json",
+      },
+    },
+  );
+}
+
+// 過濾掉不應轉發的 headers
+function filterHeaders(headers: Headers): Headers {
+  const newHeaders = new Headers();
+  for (const [k, v] of headers.entries()) {
+    const lower = k.toLowerCase();
+    if (
+      ["host", "content-length", "transfer-encoding", "connection"].includes(
+        lower,
+      )
+    ) {
+      continue;
+    }
+    newHeaders.set(k, v);
+  }
+  return newHeaders;
 }
 
 // Proxy handler
 async function handleProxy(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  const target = url.searchParams.get("url");
-
-  // API Key check
-  const clientKey = req.headers.get("x-api-key");
-  if (!API_KEY || clientKey !== API_KEY) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+  // 認證檢查
+  if (!checkAuth(req.headers.get("authorization"))) {
+    return unauthorized();
   }
 
-  if (!target) {
-    return new Response(JSON.stringify({ error: "Missing url parameter" }), { status: 400 });
+  // 取得目標 URL
+  const urlObj = new URL(req.url);
+  let targetUrl = urlObj.searchParams.get("url");
+
+  if (!targetUrl && req.headers.get("content-type")?.includes("application/json")) {
+    try {
+      const bodyJson = await req.json();
+      if (bodyJson.url) {
+        targetUrl = bodyJson.url;
+      }
+    } catch {
+      // ignore parse error
+    }
   }
 
-  let targetUrl: URL;
+  if (!targetUrl) {
+    return new Response(
+      JSON.stringify({ error: "Missing 'url' parameter in query or JSON body." }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  let upstreamResp: Response;
   try {
-    targetUrl = new URL(target);
-  } catch {
-    return new Response(JSON.stringify({ error: "Invalid URL" }), { status: 400 });
-  }
+    const filteredHeaders = filterHeaders(req.headers);
 
-  if (isPrivateHost(targetUrl)) {
-    return new Response(JSON.stringify({ error: "Blocked private host" }), { status: 403 });
-  }
-
-  // Rate limiting
-  if (!checkRateLimit(clientKey)) {
-    return new Response(JSON.stringify({ error: "Too many requests" }), { status: 429 });
-  }
-
-  try {
-    const upstream = await fetch(targetUrl.toString(), {
+    upstreamResp = await fetch(targetUrl, {
       method: req.method,
-      headers: req.headers,
-      body: req.method !== "GET" ? await req.arrayBuffer() : undefined,
+      headers: filteredHeaders,
+      body: req.method !== "GET" && req.method !== "HEAD"
+        ? await req.arrayBuffer()
+        : undefined,
     });
 
-    const respHeaders = new Headers(upstream.headers);
-    respHeaders.set("x-proxy-by", "deno-deploy");
+    // 過濾掉不應回傳的 headers
+    const respHeaders = new Headers();
+    upstreamResp.headers.forEach((v, k) => {
+      const lower = k.toLowerCase();
+      if (
+        ["content-encoding", "content-length", "transfer-encoding", "connection"]
+          .includes(lower)
+      ) {
+        return;
+      }
+      respHeaders.set(k, v);
+    });
 
-    return new Response(upstream.body, {
-      status: upstream.status,
+    return new Response(upstreamResp.body, {
+      status: upstreamResp.status,
       headers: respHeaders,
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), { status: 502 });
+    return new Response(
+      JSON.stringify({ error: `Proxy request failed: ${err.message}` }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    );
   }
 }
 
+// 啟動 Deno HTTP Server
 Deno.serve(async (req: Request) => {
   const { pathname } = new URL(req.url);
 
