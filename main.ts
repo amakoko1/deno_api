@@ -1,28 +1,39 @@
-// main.ts - Deno Deploy 版代理伺服器
+// main.ts - Deno Deploy 版代理伺服器 (v2 - 標準代理認證)
 
 // 讀取環境變數
 const PROXY_USERNAME = Deno.env.get("PROXY_USERNAME") || "";
 const PROXY_PASSWORD = Deno.env.get("PROXY_PASSWORD") || "";
 
-// 檢查認證
-function checkAuth(authHeader: string | null): boolean {
-  if (!authHeader || !authHeader.startsWith("Basic ")) {
+// [修改 1] 檢查 "Proxy-Authorization" 標頭
+function checkAuth(proxyAuthHeader: string | null): boolean {
+  // 如果沒有設定使用者名稱或密碼，則不進行驗證，直接通過
+  if (!PROXY_USERNAME || !PROXY_PASSWORD) {
+    return true;
+  }
+  
+  if (!proxyAuthHeader || !proxyAuthHeader.startsWith("Basic ")) {
     return false;
   }
-  const base64 = authHeader.replace("Basic ", "");
-  const decoded = atob(base64);
-  const [user, pass] = decoded.split(":");
-  return user === PROXY_USERNAME && pass === PROXY_PASSWORD;
+  const base64 = proxyAuthHeader.replace("Basic ", "");
+  try {
+    const decoded = atob(base64);
+    const [user, pass] = decoded.split(":");
+    return user === PROXY_USERNAME && pass === PROXY_PASSWORD;
+  } catch (e) {
+    console.error("Base64 decoding failed:", e);
+    return false;
+  }
 }
 
-// 建立 401 認證挑戰回應
-function unauthorized(): Response {
+// [修改 2] 建立 407 Proxy Authentication Required 回應
+function proxyAuthenticationRequired(): Response {
   return new Response(
-    JSON.stringify({ message: "Authentication required!" }),
+    JSON.stringify({ message: "Proxy authentication required!" }),
     {
-      status: 401,
+      status: 407, // <-- 狀態碼改為 407
       headers: {
-        "WWW-Authenticate": 'Basic realm="Login Required"',
+        // <-- 標頭改為 Proxy-Authenticate
+        "Proxy-Authenticate": 'Basic realm="Login Required"',
         "Content-Type": "application/json",
       },
     },
@@ -34,10 +45,15 @@ function filterHeaders(headers: Headers): Headers {
   const newHeaders = new Headers();
   for (const [k, v] of headers.entries()) {
     const lower = k.toLowerCase();
+    // 代理認證的標頭不應該被轉發到目標伺服器
     if (
-      ["host", "content-length", "transfer-encoding", "connection"].includes(
-        lower,
-      )
+      [
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "proxy-authorization", // <-- 新增過濾
+      ].includes(lower)
     ) {
       continue;
     }
@@ -48,9 +64,9 @@ function filterHeaders(headers: Headers): Headers {
 
 // Proxy handler
 async function handleProxy(req: Request): Promise<Response> {
-  // 認證檢查
-  if (!checkAuth(req.headers.get("authorization"))) {
-    return unauthorized();
+  // [修改 3] 認證檢查，改為讀取 "proxy-authorization" 標頭
+  if (!checkAuth(req.headers.get("proxy-authorization"))) {
+    return proxyAuthenticationRequired(); // <-- 呼叫新的 407 回應函式
   }
 
   // 取得目標 URL
@@ -75,16 +91,18 @@ async function handleProxy(req: Request): Promise<Response> {
     );
   }
 
-  let upstreamResp: Response;
   try {
     const filteredHeaders = filterHeaders(req.headers);
 
-    upstreamResp = await fetch(targetUrl, {
+    const upstreamResp = await fetch(targetUrl, {
       method: req.method,
       headers: filteredHeaders,
       body: req.method !== "GET" && req.method !== "HEAD"
-        ? await req.arrayBuffer()
+        ? req.body
         : undefined,
+      // Deno Deploy 上的 fetch 支援 duplex
+      // @ts-ignore: Deno Deploy supports duplex
+      duplex: 'half' 
     });
 
     // 過濾掉不應回傳的 headers
